@@ -317,7 +317,21 @@ async function bootstrapAdmin() {
   await update('users/'+adminUid,{uid:adminUid,name:CFG.admin.name,email:CFG.admin.email,role:'admin',status:'approved',blocked:false,registrationComplete:true,createdAt:(await get('users/'+adminUid+'/createdAt'))||nowIso()});
   console.log('Manual-auth Admin account ready:',CFG.admin.email);
 }
-
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    server: "server2",
+    timestamp: new Date().toISOString()
+  });
+});
+setInterval(async () => {
+  try {
+    await fetch("https://server1-osjo.onrender.com/health");
+    console.log("Server 1 is alive");
+  } catch (err) {
+    console.error("Server 1 ping failed:", err.message);
+  }
+}, 5 * 60 * 1000);
 async function ensureProfile(uidValue, decoded = {}) {
   const p = await get('users/'+uidValue);
   if (p) return p;
