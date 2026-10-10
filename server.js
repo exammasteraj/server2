@@ -467,7 +467,7 @@ const emailShell = (title, body) => '<div style="font-family:Arial,sans-serif;ma
 
 function summarizeTest(t) {
   return {
-    id:t.id,title:t.title,exam:t.exam,category:t.category,subjects:t.subjects||['General'],
+    id:t.id,title:t.title,exam:t.exam,category:t.category,subjects:t.subjects||['General'],sectionQuestionCounts:t.sectionQuestionCounts||{},
     languages:t.languages?.length?t.languages:['English'],type:t.type,attemptPolicy:t.attemptPolicy==='once'?'once':'reattempt',
     price:t.price||0,duration:t.duration,questionCount:t.questionCount,createdAt:t.createdAt,published:t.published
   };
@@ -480,9 +480,31 @@ async function activeSubscription(uidValue) {
   return subs.sort((a,b)=>new Date(b.expiresAt)-new Date(a.expiresAt))[0] || null;
 }
 
+async function server1ActiveSubscription(studentId) {
+  const secret=String(process.env.INTERNAL_AUTH_SECRET||'');
+  if(!secret) throw Object.assign(new Error('Premium access verification is temporarily unavailable.'),{status:503});
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),5000);
+  try {
+    const response=await fetch(SERVER1_URL+'/api/internal/subscription/active?studentId='+encodeURIComponent(studentId),{
+      method:'GET',
+      headers:{'X-Internal-Auth':secret,'Accept':'application/json'},
+      signal:controller.signal
+    });
+    const payload=await response.json().catch(()=>({}));
+    if(!response.ok || typeof payload.active!=='boolean') throw Object.assign(new Error('Premium access verification is temporarily unavailable.'),{status:503});
+    return payload.active===true;
+  } catch(err) {
+    if(err.status) throw err;
+    throw Object.assign(new Error('Premium access verification is temporarily unavailable. Please retry in a moment.'),{status:503});
+  } finally { clearTimeout(timer); }
+}
+
 async function paidAccessBlocked(test, user) {
   if (test.type !== 'paid' || user.role !== 'student') return false;
-  if (await activeSubscription(user.uid)) return false;
+  // Server 1 owns subscription/payment records; Server 2 has a separate RTDB.
+  // Query the authoritative subscription source instead of trusting stale local copies.
+  if (await server1ActiveSubscription(user.uid)) return false;
   const purchases = Object.values(await allMap('purchases'));
   return !purchases.some(p=>p.testId===test.id && p.studentId===user.uid && p.status==='approved');
 }
@@ -498,7 +520,9 @@ async function attemptBlocked(test,user){
 async function body(req) {
   return new Promise((resolve,reject)=>{
     const chunks=[]; let size=0;
-    req.on('data', c=>{ size+=c.length; if(size>5e6){ reject(new Error('Request too large')); req.destroy(); return; } chunks.push(c); });
+    // A test can contain many individually compressed question images; allow a bounded 25 MB payload.
+    const maxBodyBytes=25*1024*1024;
+    req.on('data', c=>{ size+=c.length; if(size>maxBodyBytes){ reject(Object.assign(new Error('Request too large. Keep the complete test under 25 MB.'),{status:413})); req.destroy(); return; } chunks.push(c); });
     req.on('end',()=>{ try{ resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}')); }catch(e){ reject(new Error('Invalid JSON body.')); }});
     req.on('error',reject);
   });
@@ -922,7 +946,7 @@ async function route(req, res) {
     const attemptId=crypto.randomBytes(24).toString('base64url'), startedAt=Date.now(), durationMs=Math.max(60000,Math.min(Number(t.duration)||30,1440)*60000);
     const attempt={id:attemptId,testId:t.id,userId:user.uid,startedAt:new Date(startedAt).toISOString(),expiresAt:new Date(startedAt+durationMs).toISOString(),status:'active',questionCount:t.questions.length};
     await set('examAttempts/'+attemptId,attempt);
-    return send(res,200,{...summarizeTest(t),attemptId,serverStartedAt:attempt.startedAt,serverExpiresAt:attempt.expiresAt,questions:t.questions.map((q,i)=>({index:i,question:q.question,options:q.options,subject:q.subject||'General',marks:q.marks,negative:q.negative,translations:q.translations||{}}))});
+    return send(res,200,{...summarizeTest(t),attemptId,serverStartedAt:attempt.startedAt,serverExpiresAt:attempt.expiresAt,questions:t.questions.map((q,i)=>({index:i,question:q.question,options:q.options,subject:q.subject||'General',marks:q.marks,negative:q.negative,instructions:q.instructions||'',imageDataUrl:q.imageDataUrl||'',translations:q.translations||{}}))});
   }
   if(mTest && method==='GET' && mTest[2]==='solution'){
     const {user}=await currentUser(req), tests=await allMap('tests'), t=tests[decodeURIComponent(mTest[1])];
@@ -972,6 +996,14 @@ async function route(req, res) {
     const categoryName=String(selectedModule.name||'').trim();
     if(!b.title || !Array.isArray(b.questions) || !b.questions.length) throw new Error('Test title and at least one question are required.');
     let subjects=Array.isArray(b.subjects)?b.subjects.map(String).map(s=>s.trim()).filter(Boolean):['General']; subjects=[...new Set(subjects)];
+    const sectionQuestionCounts={};
+    if(b.sectionQuestionCounts && typeof b.sectionQuestionCounts==='object' && !Array.isArray(b.sectionQuestionCounts)){
+      for(const [rawName,rawCount] of Object.entries(b.sectionQuestionCounts)){
+        const name=String(rawName||'').trim(), count=Number(rawCount);
+        if(!name || !Number.isInteger(count) || count<1 || count>500) throw new Error('Section target counts must be whole numbers from 1 to 500.');
+        sectionQuestionCounts[name]=count;
+      }
+    }
     let languages=Array.isArray(b.languages)?b.languages.map(String).map(s=>s.trim()).filter(Boolean):['English']; languages=[...new Set(languages.length?languages:['English'])];
     const secondary=languages.slice(1), qs=[];
     b.questions.forEach((q,i)=>{
@@ -982,9 +1014,15 @@ async function route(req, res) {
         const tr=q.translations?.[lang];
         if(tr && (tr.question||tr.options?.some(Boolean))) translations[lang]={question:String(tr.question||''),options:[0,1,2,3].map(k=>String(tr.options?.[k]||''))};
       }
-      qs.push({question,options,answer,subject:String(q.subject||'General').trim()||'General',marks:Number.isFinite(Number(q.marks))?Number(q.marks):1,negative:Number.isFinite(Number(q.negative))?Number(q.negative):0,explanation:String(q.explanation||''),translations});
+      const imageDataUrl=String(q.imageDataUrl||'');
+      if(imageDataUrl && (!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(imageDataUrl) || imageDataUrl.length>520000)) throw new Error('Question '+(i+1)+' image must be a compressed JPEG under 400 KB.');
+      qs.push({question,options,answer,subject:String(q.subject||'General').trim()||'General',marks:Number.isFinite(Number(q.marks))?Number(q.marks):1,negative:Number.isFinite(Number(q.negative))?Number(q.negative):0,explanation:String(q.explanation||''),instructions:String(q.instructions||'').trim().slice(0,2000),imageDataUrl,translations});
     });
-    const t={id:uid('T'),title:String(b.title).trim(),exam:String(b.exam||'Competitive Exam').trim(),category:categoryName,subjects,languages,type:String(b.type||'FREE').toUpperCase()==='PAID'?'paid':'free',price:0,duration:Number.parseInt(b.duration,10)||30,questions:qs,questionCount:qs.length,createdBy:user.email,createdById:user.uid,createdAt:nowIso(),published:true,attemptPolicy:b.attemptPolicy==='once'?'once':'reattempt'};
+    for(const [section,target] of Object.entries(sectionQuestionCounts)){
+      const actual=qs.filter(q=>(q.subject||'General')===section).length;
+      if(actual!==target) throw new Error(section+': expected '+target+' questions but received '+actual+'.');
+    }
+    const t={id:uid('T'),title:String(b.title).trim(),exam:String(b.exam||'Competitive Exam').trim(),category:categoryName,subjects,sectionQuestionCounts,languages,type:String(b.type||'FREE').toUpperCase()==='PAID'?'paid':'free',price:0,duration:Number.parseInt(b.duration,10)||30,questions:qs,questionCount:qs.length,createdBy:user.email,createdById:user.uid,createdAt:nowIso(),published:true,attemptPolicy:b.attemptPolicy==='once'?'once':'reattempt'};
     const tests=await allMap('tests'); tests[t.id]=t; await set('tests',tests);
     return send(res,200,{message:'Test Series added successfully and published.',test:summarizeTest(t)});
   }
