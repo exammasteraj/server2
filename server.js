@@ -656,7 +656,80 @@ async function route(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const method = req.method;
   if (method==='OPTIONS') return send(res,204,{});
-  if (process.env.SERVER_ROLE === 'exam' && !(url.pathname==='/api/health' || url.pathname==='/api/internal/auth/verify' || url.pathname==='/api/modules' || url.pathname.startsWith('/api/modules/') || url.pathname==='/api/tests' || url.pathname.startsWith('/api/tests/') || url.pathname==='/api/admin/ratings')) return send(res,404,{error:'This endpoint belongs to Server 1.'});
+  // Private service-to-service endpoints. These must be handled before the
+  // SERVER_ROLE ownership guard and are never exposed without shared-secret auth.
+  const internalPaths = url.pathname.startsWith('/api/internal/');
+  if (internalPaths && !['/api/internal/auth/verify'].includes(url.pathname)) {
+    const expected = String(process.env.INTERNAL_AUTH_SECRET || '').trim();
+    const supplied = String(req.headers['x-internal-auth'] || '').trim();
+    if (!expected || !supplied || supplied !== expected) return send(res, 403, { error: 'Forbidden.' });
+    if (url.pathname === '/api/internal/tests/' || url.pathname === '/api/internal/tests') return send(res, 400, { error: 'Test ID required.' });
+    const internalTestMatch = url.pathname.match(/^\/api\/internal\/tests\/([^/]+)$/);
+    if (internalTestMatch && method === 'GET') {
+      const testId = decodeURIComponent(internalTestMatch[1]);
+      const test = (await allMap('tests'))[testId];
+      if (!test || !test.published) return send(res, 404, { error: 'Test not found.' });
+      return send(res, 200, { test: {
+        id: String(test.id || testId), title: String(test.title || ''), type: test.type === 'paid' ? 'paid' : 'free',
+        price: Number(test.price) || 0, published: true, category: String(test.category || ''),
+        duration: Number(test.duration) || 0
+      }});
+    }
+    if (url.pathname === '/api/internal/modules' && method === 'DELETE') {
+      const name = String(url.searchParams.get('name') || '').trim();
+      if (!name || name.length > 100) return send(res, 400, { error: 'Valid module name required.' });
+      const tests = await allMap('tests');
+      const matching = Object.values(tests).filter(t => String(t.category || '').toLowerCase() === name.toLowerCase());
+      const ids = new Set(matching.map(t => String(t.id || '')).filter(Boolean));
+      const cleanRecords = async collection => {
+        const records = await allMap(collection);
+        let changed = false;
+        for (const [key, value] of Object.entries(records)) {
+          if (value && ids.has(String(value.testId || ''))) { delete records[key]; changed = true; }
+        }
+        if (changed) await set(collection, records);
+      };
+      for (const test of matching) {
+        const id = String(test.id || '');
+        if (id) {
+          await remove('tests/' + encodeURIComponent(id));
+          await remove('attemptLocks/' + encodeURIComponent(id));
+          await remove('scoreIndex/' + encodeURIComponent(id));
+        }
+      }
+      await cleanRecords('submissions');
+      await cleanRecords('ratings');
+      await cleanRecords('examAttempts');
+      return send(res, 200, { message: 'Module test data removed.', deletedTests: matching.length });
+    }
+    if (url.pathname === '/api/internal/backup' && method === 'GET') {
+      const backup = {};
+      for (const name of ['tests','submissions','ratings','attemptLocks','examAttempts','scoreIndex']) {
+        backup[name] = (await get(name)) ?? {};
+      }
+      return send(res, 200, { backup });
+    }
+    if (url.pathname === '/api/internal/backup' && method === 'POST') {
+      const payload = await body(req);
+      const backup = payload && payload.backup && typeof payload.backup === 'object' ? payload.backup : payload;
+      const allowed = ['tests','submissions','ratings','attemptLocks','examAttempts','scoreIndex'];
+      const values = {};
+      for (const name of allowed) {
+        if (backup[name] !== undefined) {
+          if (!backup[name] || typeof backup[name] !== 'object' || Array.isArray(backup[name])) {
+            return send(res, 400, { error: 'Invalid backup collection: ' + name });
+          }
+          values[name] = backup[name];
+        }
+      }
+      if (!Object.keys(values).length) return send(res, 400, { error: 'No valid exam data supplied.' });
+      await multiUpdate(values);
+      return send(res, 200, { message: 'Exam data restored.', restoredCollections: Object.keys(values) });
+    }
+    return send(res, 404, { error: 'Internal endpoint not found.' });
+  }
+
+  if (process.env.SERVER_ROLE === 'exam' && !(url.pathname==='/api/health' || url.pathname==='/api/internal/auth/verify' || url.pathname.startsWith('/api/internal/') || url.pathname==='/api/modules' || url.pathname.startsWith('/api/modules/') || url.pathname==='/api/tests' || url.pathname.startsWith('/api/tests/') || url.pathname==='/api/admin/ratings')) return send(res,404,{error:'This endpoint belongs to Server 1.'});
   if (url.pathname.startsWith('/api/') && method!=='GET' && url.pathname!=='/api/webhook' && url.pathname!=='/api/internal/auth/verify') { rateLimit(req,'api-global',180,60000); }
 
   if (url.pathname==='/api/config' && method==='GET') {
