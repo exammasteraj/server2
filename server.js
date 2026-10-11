@@ -31,7 +31,7 @@ const KEEPALIVE_MS = Math.max(60000, Number(process.env.KEEPALIVE_MS || 300000))
 
 async function pingServer1() {
   try {
-    const response = await fetch(SERVER1_URL + '/health', {
+    const response = await fetch(SERVER1_URL + '/api/health', {
       method: 'GET',
       headers: { 'User-Agent': 'CompetitiveExamMaster-Server2/1.0' }
     });
@@ -492,10 +492,14 @@ async function server1ActiveSubscription(studentId) {
       signal:controller.signal
     });
     const payload=await response.json().catch(()=>({}));
-    if(!response.ok || typeof payload.active!=='boolean') throw Object.assign(new Error('Premium access verification is temporarily unavailable.'),{status:503});
+    if(!response.ok || typeof payload.active!=='boolean') {
+      console.error('[Premium verification] Server 1 subscription endpoint returned HTTP '+response.status+'; response='+JSON.stringify(payload).slice(0,300));
+      throw Object.assign(new Error('Premium access verification is temporarily unavailable.'),{status:503});
+    }
     return payload.active===true;
   } catch(err) {
     if(err.status) throw err;
+    console.error('[Premium verification] Server 1 subscription request failed:',err.name||'Error',String(err.message||'').slice(0,200));
     throw Object.assign(new Error('Premium access verification is temporarily unavailable. Please retry in a moment.'),{status:503});
   } finally { clearTimeout(timer); }
 }
@@ -512,11 +516,13 @@ async function server1ApprovedPurchase(studentId, testId) {
     );
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || typeof payload.approved !== 'boolean') {
+      console.error('[Purchase verification] Server 1 purchase endpoint returned HTTP '+response.status+'; response='+JSON.stringify(payload).slice(0,300));
       throw Object.assign(new Error('Paid access verification is temporarily unavailable.'), { status: 503 });
     }
     return payload.approved;
   } catch (err) {
     if (err.status) throw err;
+    console.error('[Purchase verification] Server 1 purchase request failed:',err.name||'Error',String(err.message||'').slice(0,200));
     throw Object.assign(new Error('Paid access verification is temporarily unavailable. Please retry in a moment.'), { status: 503 });
   } finally {
     clearTimeout(timer);
