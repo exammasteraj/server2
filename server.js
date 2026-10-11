@@ -45,7 +45,7 @@ async function pingServer1() {
 setInterval(pingServer1, KEEPALIVE_MS).unref();
 
 const CFG = {
-  port: Number(process.env.SERVER2_PORT || 3001),
+  port: Number(process.env.PORT || process.env.SERVER2_PORT || 3001),
   dbUrl: process.env.SERVER2_FIREBASE_DATABASE_URL || '',
   projectId: process.env.SERVER2_FIREBASE_PROJECT_ID || '',
   clientEmail: process.env.SERVER2_FIREBASE_CLIENT_EMAIL || '',
@@ -500,13 +500,34 @@ async function server1ActiveSubscription(studentId) {
   } finally { clearTimeout(timer); }
 }
 
+async function server1ApprovedPurchase(studentId, testId) {
+  const secret = String(process.env.INTERNAL_AUTH_SECRET || '');
+  if (!secret) throw Object.assign(new Error('Paid access verification is temporarily unavailable.'), { status: 503 });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(
+      SERVER1_URL + '/api/internal/purchase/approved?studentId=' + encodeURIComponent(studentId) + '&testId=' + encodeURIComponent(testId),
+      { method: 'GET', headers: { 'X-Internal-Auth': secret, 'Accept': 'application/json' }, signal: controller.signal }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || typeof payload.approved !== 'boolean') {
+      throw Object.assign(new Error('Paid access verification is temporarily unavailable.'), { status: 503 });
+    }
+    return payload.approved;
+  } catch (err) {
+    if (err.status) throw err;
+    throw Object.assign(new Error('Paid access verification is temporarily unavailable. Please retry in a moment.'), { status: 503 });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function paidAccessBlocked(test, user) {
   if (test.type !== 'paid' || user.role !== 'student') return false;
-  // Server 1 owns subscription/payment records; Server 2 has a separate RTDB.
-  // Query the authoritative subscription source instead of trusting stale local copies.
+  // Server 1 is the authoritative source for subscriptions and individual test approvals.
   if (await server1ActiveSubscription(user.uid)) return false;
-  const purchases = Object.values(await allMap('purchases'));
-  return !purchases.some(p=>p.testId===test.id && p.studentId===user.uid && p.status==='approved');
+  return !(await server1ApprovedPurchase(user.uid, test.id));
 }
 
 async function attemptBlocked(test,user){
@@ -951,6 +972,7 @@ async function route(req, res) {
   if(mTest && method==='GET' && mTest[2]==='solution'){
     const {user}=await currentUser(req), tests=await allMap('tests'), t=tests[decodeURIComponent(mTest[1])];
     if(!t) throw new Error('Test not found.');
+    if(await paidAccessBlocked(t,user)) throw Object.assign(new Error('You do not have access to this paid test series.'),{status:403});
     const submissions=Object.values(await allMap('submissions'))
       .filter(s=>s&&s.testId===t.id&&s.userId===user.uid)
       .sort((a,b)=>new Date(a.submittedAt||0)-new Date(b.submittedAt||0));
