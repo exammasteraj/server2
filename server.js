@@ -1030,6 +1030,15 @@ async function route(req, res) {
     return send(res,200,{message:t.attemptPolicy==='once'?'Students can attempt this test only once.':'Students can reattempt this test.',test:summarizeTest(t)});
   }
 
+  const mEditTest=url.pathname.match(/^\/api\/tests\/([^/]+)\/edit$/);
+  if(mEditTest && method==='GET'){
+    const {user}=await currentUser(req,['admin','teacher']);
+    const tests=await allMap('tests'), t=tests[decodeURIComponent(mEditTest[1])];
+    if(!t) throw Object.assign(new Error('Test series not found.'),{status:404});
+    if(!ownsTest(user,t) && user.role!=='admin') throw Object.assign(new Error('You can only edit your own test series.'),{status:403});
+    return send(res,200,{test:{...t,questions:(t.questions||[]).map(q=>({...q,options:Array.isArray(q.options)?q.options:[]}))}});
+  }
+
   const mTest=url.pathname.match(/^\/api\/tests\/([^/]+)(?:\/(solution|submit|start))?$/);
   if(mTest && method==='GET' && !mTest[2]) {
     const {user}=await currentUser(req), tests=await allMap('tests'), t=tests[decodeURIComponent(mTest[1])];
@@ -1126,6 +1135,59 @@ async function route(req, res) {
     const t={id:uid('T'),title:String(b.title).trim(),exam:String(b.exam||'Competitive Exam').trim(),category:categoryName,subjects,sectionQuestionCounts,languages,type:String(b.type||'FREE').toUpperCase()==='PAID'?'paid':'free',price:0,duration:Number.parseInt(b.duration,10)||30,questions:qs,questionCount:qs.length,createdBy:user.email,createdById:user.uid,createdAt:nowIso(),published:true,attemptPolicy:b.attemptPolicy==='once'?'once':'reattempt'};
     const tests=await allMap('tests'); tests[t.id]=t; await set('tests',tests);
     return send(res,200,{message:'Test Series added successfully and published.',test:summarizeTest(t)});
+  }
+
+  const mUpdateTest=url.pathname.match(/^\/api\/tests\/([^/]+)$/);
+  if(mUpdateTest && method==='PUT'){
+    const {user}=await currentUser(req,['admin','teacher']);
+    const tests=await allMap('tests'), id=decodeURIComponent(mUpdateTest[1]), existing=tests[id];
+    if(!existing) throw Object.assign(new Error('Test series not found.'),{status:404});
+    if(!ownsTest(user,existing) && user.role!=='admin') throw Object.assign(new Error('You can only edit your own test series.'),{status:403});
+    const b=await body(req);
+    const title=String(b.title||'').trim();
+    if(!title || title.length>200) throw new Error('Test series title is required and must be at most 200 characters.');
+    if(!Array.isArray(b.questions)||!b.questions.length||b.questions.length>500) throw new Error('Add between 1 and 500 questions.');
+    const requestedModule=String(b.category ?? b.moduleId ?? b.module ?? '').trim();
+    if(!requestedModule) throw new Error('Please choose a valid exam module.');
+    const mods=await authoritativeModules();
+    const selectedModule=mods.find(m=>m&&typeof m==='object'&&(requestedModule===String(m.id||'').trim()||(String(m.name||'').trim()&&String(m.name).trim().toLowerCase()===requestedModule.toLowerCase())));
+    if(!selectedModule) throw new Error('Please choose a valid exam module.');
+    const categoryName=String(selectedModule.name||'').trim();
+    const subjects=Array.isArray(b.subjects)?[...new Set(b.subjects.map(v=>String(v).trim()).filter(Boolean))]:['General'];
+    const sectionQuestionCounts={};
+    if(b.sectionQuestionCounts&&typeof b.sectionQuestionCounts==='object'&&!Array.isArray(b.sectionQuestionCounts)){
+      for(const [rawName,rawCount] of Object.entries(b.sectionQuestionCounts)){
+        const name=String(rawName||'').trim(),count=Number(rawCount);
+        if(!name||!Number.isInteger(count)||count<1||count>500) throw new Error('Section target counts must be whole numbers from 1 to 500.');
+        sectionQuestionCounts[name]=count;
+      }
+    }
+    const languages=Array.isArray(b.languages)?[...new Set(b.languages.map(v=>String(v).trim()).filter(Boolean))]:['English'];
+    const secondary=languages.slice(1), questions=[];
+    b.questions.forEach((q,i)=>{
+      const question=String(q.question||'').trim();
+      const options=Array.isArray(q.options)?q.options.map(v=>String(v||'').trim()):[];
+      const answer=String(q.answer||'').trim().toUpperCase();
+      if(!question||options.length!==4||options.some(v=>!v)||!['A','B','C','D'].includes(answer)) throw new Error('Question '+(i+1)+' is invalid. Enter the question, all four options, and the correct answer.');
+      const translations={};
+      for(const lang of secondary){
+        const tr=q.translations&&q.translations[lang];
+        if(tr&&(tr.question||tr.options?.some(Boolean))) translations[lang]={question:String(tr.question||''),options:[0,1,2,3].map(k=>String(tr.options?.[k]||''))};
+      }
+      const imageDataUrl=String(q.imageDataUrl||'');
+      if(imageDataUrl&&(!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(imageDataUrl)||imageDataUrl.length>520000)) throw new Error('Question '+(i+1)+' image must be a compressed JPEG under 400 KB.');
+      questions.push({question,options,answer,subject:String(q.subject||'General').trim()||'General',marks:Number.isFinite(Number(q.marks))?Number(q.marks):1,negative:Number.isFinite(Number(q.negative))?Number(q.negative):0,explanation:String(q.explanation||''),instructions:String(q.instructions||'').trim().slice(0,2000),imageDataUrl,translations});
+    });
+    for(const [section,target] of Object.entries(sectionQuestionCounts)){
+      const actual=questions.filter(q=>(q.subject||'General')===section).length;
+      if(actual!==target) throw new Error(section+': expected '+target+' questions but received '+actual+'.');
+    }
+    const duration=Number.parseInt(b.duration,10);
+    if(!Number.isInteger(duration)||duration<1||duration>1440) throw new Error('Duration must be between 1 and 1440 minutes.');
+    const updated={...existing,title,exam:String(b.exam||'Competitive Exam').trim(),category:categoryName,subjects,sectionQuestionCounts,languages:languages.length?languages:['English'],type:String(b.type||'FREE').toUpperCase()==='PAID'?'paid':'free',price:0,duration,questions,questionCount:questions.length,published:true,attemptPolicy:b.attemptPolicy==='once'?'once':'reattempt',updatedAt:nowIso(),updatedBy:user.email||user.uid};
+    tests[id]=updated;
+    await set('tests',tests);
+    return send(res,200,{message:'Published test series updated successfully.',test:summarizeTest(updated)});
   }
 
   const mDeleteTest=url.pathname.match(/^\/api\/tests\/([^/]+)$/);
