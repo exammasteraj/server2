@@ -1039,6 +1039,24 @@ async function route(req, res) {
     return send(res,200,{test:{...t,questions:(t.questions||[]).map(q=>({...q,options:Array.isArray(q.options)?q.options:[]}))}});
   }
 
+  // Repair legacy published tests whose questions were all stored as "General".
+  // Infer section membership only when explicit section counts account for every question.
+  function normalizeLegacyQuestionSections(test){
+    const questions=Array.isArray(test.questions)?test.questions:[];
+    const subjects=Array.isArray(test.subjects)?[...new Set(test.subjects.map(s=>String(s||'').trim()).filter(Boolean))]:[];
+    if(questions.length===0||subjects.length<2) return false;
+    if(!questions.every(q=>String(q.subject||'General').trim()==='General')) return false;
+    const counts=test.sectionQuestionCounts;
+    if(!counts||typeof counts!=='object'||Array.isArray(counts)) return false;
+    const targets=subjects.map(name=>({name,count:Number(counts[name])}));
+    if(targets.some(x=>!Number.isInteger(x.count)||x.count<1)||targets.reduce((sum,x)=>sum+x.count,0)!==questions.length) return false;
+    let index=0;
+    for(const target of targets){
+      for(let n=0;n<target.count;n++) questions[index++].subject=target.name;
+    }
+    return true;
+  }
+
   const mTest=url.pathname.match(/^\/api\/tests\/([^/]+)(?:\/(solution|submit|start))?$/);
   if(mTest && method==='GET' && !mTest[2]) {
     const {user}=await currentUser(req), tests=await allMap('tests'), t=tests[decodeURIComponent(mTest[1])];
@@ -1050,6 +1068,7 @@ async function route(req, res) {
   if(mTest && method==='POST' && mTest[2]==='start') {
     const {user}=await currentUser(req), tests=await allMap('tests'), t=tests[decodeURIComponent(mTest[1])];
     if(!t||!t.published) throw new Error('Test not found.');
+    if(normalizeLegacyQuestionSections(t)) await set('tests/'+t.id,t);
     if(await paidAccessBlocked(t,user)) throw new Error('This is a Premium test series. Subscribe to Premium to access all paid test series.');
     if(await attemptBlocked(t,user)) throw Object.assign(new Error('You have already attempted this test. Only one attempt is allowed for this test series.'),{status:409});
     const attemptId=crypto.randomBytes(24).toString('base64url'), startedAt=Date.now(), durationMs=Math.max(60000,Math.min(Number(t.duration)||30,1440)*60000);
@@ -1494,7 +1513,7 @@ async function calculateResult(t, answers, timeBySubject, saveAttempt, user, sol
       if(given===q.answer){score+=Number(q.marks)||0;correct++;sec.correct++;outcome='correct';}
       else{score-=Number(q.negative)||0;incorrect++;sec.incorrect++;outcome='incorrect';}
     } else unattempted++;
-    return {index:i,question:q.question,options:q.options,correctAnswer:q.answer,givenAnswer:given,outcome,explanation:q.explanation||''};
+    return {index:i,question:q.question,options:q.options,correctAnswer:q.answer,givenAnswer:given,outcome,explanation:q.explanation||'',instructions:q.instructions||'',subject:subj};
   });
   score=Math.round(score*100)/100; const maxScore=Math.round(t.questions.reduce((s,q)=>s+(Number(q.marks)||0),0)*100)/100; const attempted=correct+incorrect; const accuracy=attempted?Math.round(correct/attempted*1000)/10:0;
   const timeForSubject=(subject)=>{const raw=timeBySubject&&typeof timeBySubject==='object'?timeBySubject:{}; const direct=raw[subject]; if(direct!==undefined)return Number(direct)||0; const encoded=encodeFirebaseKey(subject); return Number(raw[encoded]||0)||0;};
